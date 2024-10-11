@@ -1,8 +1,13 @@
 import torch
+import torchvision
+from torchvision.ops import nms
 import numpy as np
 
 ##### Global Variables #####
-TOPK = 12000
+PRE_NMS_TOPK = 12000
+FINAL_TOPK = 2000
+LOW_IOU_THRESHOLD = 0.3
+HIHG_IOU_THRESHOLD = 0.7
 ############################
 
 def compute_iou(boxes1, boxes2):
@@ -136,18 +141,37 @@ def apply_transform_to_baseAnchors_or_prposals(box_transform_pred, baseAnchors_o
     return pred_boxes
 
 def clamp_boxes(boxes, image_shape):
-    xmin, ymin, xmax, ymax = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+    '''
+    :boxes: [num_boxes, ..., 4]
+    returns:
+        :clamped_boxes: [num_boxes, ..., 4]
+    '''
+    xmin, ymin, xmax, ymax = boxes[..., 0], boxes[..., 1], boxes[..., 2], boxes[..., 3]
     width, height = image_shape[-2:]
-    # 
+    # clamp
+    xmin = xmin.clamp(min=0, max=width) # [num_boxes, ...] last dimension removed by slicing in the first last
+    ymin = ymin.clamp(min=0, max=height)
+    xmax = xmax.clamp(min=0, max=width)
+    ymax = ymax.clamp(min=0, max=height)
+    # Reconstructing boxes
+    clamped_boxes = torch.cat((
+        xmin[:, None], # Adding new dimensions to make [num_boxes, ..., 1]
+        ymin[:, None],
+        xmax[:, None],
+        ymax[:, None]),
+        dim=-1)
+    # Concat result in clamped_boxes : [num_boxes, ..., 4]
+    return clamped_boxes
+                             
 
 def sample_proposals(proposals, cls_scores, image_shape):
     '''
     This method samples positive / negative proposals from transformed anchor boxes
     1. Pre NMS topK filtering
     2. Make proposals valid by clamping coordinates(0, width/height)
-    2. Small Boxes filtering based on width and height
-    3. NMS
-    4. Post NMS topK filtering
+    3. Small Boxes filtering based on width and height
+    4. NMS
+    5. Post NMS topK filtering
     params:
         :proposals: [num_anchors, 4]
         :cls_scores: [num_anchors, 1]
@@ -157,9 +181,144 @@ def sample_proposals(proposals, cls_scores, image_shape):
     # Step 1: Pre NMS topK
     cls_scores = cls_scores.reshape(-1)    # [num_anchors, ]
     cls_scores = torch.sigmoid(cls_scores) # All scores are distributed between 0 and 1
-    _, topk_idx = torch.topk(cls_scores, min(TOPK, len(cls_scores)))
+    _, topk_idx = torch.topk(cls_scores, min(PRE_NMS_TOPK, len(cls_scores)))
     proposals = proposals[topk_idx]
     cls_scores[topk_idx]
     
     # Step 2: Clamp boxes to fit in image
     proposals = clamp_boxes(proposals, image_shape)
+
+    # Step 3: Filter out small boxes based on min size width/height
+    min_size = 16
+    ws, hs = proposals[:, 2] - proposals[:, 0], proposals[:, 3] - proposals[:, 1]
+    keep = (ws >= min_size) & (hs >= min_size) # 0s and 1s
+    keep = torch.where(keep)[0] # Trues and Falses
+    proposals = proposals[keep]
+    cls_scores = cls_scores[keep]
+
+    # Step 4: Apply NMS based on the objectness score
+    keep_idx = nms(proposals, cls_scores, 0.7)
+    # Sort
+    sorted_keep_idx = keep_idx[cls_scores[keep_idx].sort(descending=True)[1]]
+
+    # Step 5: TopK objectness proposals after NMS
+    proposals = proposals[sorted_keep_idx[:FINAL_TOPK]]
+    cls_scores = cls_scores[sorted_keep_idx[:FINAL_TOPK]]
+
+    return proposals, cls_scores
+
+
+def assign_targets_to_anchors(gt_boxes, anchors):
+    '''
+    This method assigns labels(-1, 0, 1) to each anchor as well as ground truth box from the gt_boxes list.
+    labels:
+        -1 : Ignore (low_threshold < iou < high_threshold)
+         0 : Background (iou < low_threshold)
+         1 : Foreground (high_threshold < iou)
+    paramenters:
+        :gt_boxes: [num_gt_boxes_of_an_image, 4] #(N, 4)
+        :anchors: [num_anchors_of_an_image, 4]   #(M, 4)
+    returns:
+        :matched_labels: [num_anchors_of_an_image, ]    #(M,)
+        :matched_gt_boxes: [num_anchors_of_an_image, 4] #(M, 4)
+    *Note: Returned matched_gt_boxes also assigns gt_box to background/ignore anchors which will be filtered later
+    '''
+    # Step 1: Calculate IoU matrix
+    iou_matrix = compute_iou(gt_boxes, anchors) # (N, M)
+    # Step 2: For each anchor, get the GT box index with the highest IoU
+    best_iou, best_gt_idx = iou_matrix.max(dim=0) # [num_anchors_of_an_iamge,] = (M,)
+    # Step 3: Initialize labels as background (-1)
+    labels = torch.full_like(best_iou, fill_value=-1, dtype=torch.float32)
+    # Step 4: Apply thresholds to assign foreground (1) and background (0)
+    labels[best_iou >= HIGH_IOU_THRESHOLD] = 1
+    labels[best_iou < LOW_IOU_THRESHOLD] = 0
+    # Step 5: For each GT box, get the maximum IoU value amongst all anchors
+    max_iou_for_gt, _ = iou_matrix.max(dim=1) # [num_gt_boxes_of_an_image,] = (N,)
+    # Step 6: Identify anchors with the highest IoU for each GT box
+    gt_pair_with_highest_iou = torch.where(iou_matrix == max_iou_for_gt[:, None]) # [num_gt_boxes_of_an_image, num_anchors_of_an_image] = (N, M)
+    anchor_idx_to_update = gt_pair_with_highest_iou[1]
+    # Step 7: Ensure the highest IoU anchors are labeled as foreground
+    labels[anchor_idx_to_update] = 1
+    # Step 8: Matched GT boxes 
+    matched_gt_boxes = gt_boxes[best_gt_idx]
+
+    return labels, matched_gt_boxes
+
+
+def compute_bbox_transformation_targets(gt_boxes, anchors_or_proposals):
+    '''
+    This method computes the bounding box regression targets (tx, ty, tw, th)
+    provided all anchors/proposals and corresponding target gt_boxes
+    variables:
+        G_*: gt_boxes
+        P_*: anchors_or_proposals
+        t_*: target offsets
+    parameters:
+        :gt_boxes: [num_anchors_or_proposals_in_an_image, 4] = (N, 4) (We assign one gt_box to each anchor/proposal)
+        :anchors_or_proposals: [num_anchors_or_proposals_in_an_image, 4] = (N, 4)
+    returns:
+        :target_offsets: [num_anchors_or_proposals_in_an_image, 4] = (N, 4)
+    '''
+    # anchors_or_proposals info Shape: (N,)
+    P_w = anchors_or_proposals[:, 2] - anchors_or_proposals[:, 0]
+    P_h = anchors_or_proposals[:, 3] - anchors_or_proposals[:, 1]
+    P_x = anchors_or_proposals[:, 0] + (0.5 * P_w)
+    P_y = anchors_or_proposals[:, 1] + (0.5 * P_h)
+
+    # gt_boxes info Shape: (N,)
+    G_w = gt_boxes[:, 2] - gt_boxes[:, 0]
+    G_h = gt_boxes[:, 3] - gt_boxes[:, 1]
+    G_x = gt_boxes[:, 0] + (0.5 * G_w)
+    G_y = gt_boxes[:, 1] + (0.5 * G_h)
+
+    # Target offsets Shape: (N, 4)
+    t_x = (G_x - P_x) / P_w
+    t_y = (G_y - P_y) / P_h
+    t_w = torch.log(G_w / P_w)
+    t_h = torch.log(G_h / P_h)
+    
+    target_offsets = torch.stack((t_x, t_y, t_w, t_h), dim=1)
+    
+    return target_offsets
+
+
+def sample_positive_and_negative(labels, positive_ct, total_ct):
+    pos_idx = torch.where(labels >= 1)[0]
+    neg_idx = torch.where(labels == 0)[0]
+    actual_positive_ct = min(pos_idx.numel(), positive_ct)
+    negative_ct = total_ct - actual_positive_ct
+    actual_negative_ct = min(negative_ct, neg_idx.numel())
+
+    # Random sampling
+    random_idx_pos = torch.randperm(pos_idx.size(0), device=pos_idx.device)[:actual_positive_ct]
+    random_idx_neg = torch.randperm(neg_idx.size(0), device=neg_idx.device)[:actual_negative_ct]
+    pos_idx = pos_idx[random_idx_pos]
+    neg_idx = neg_idx[random_idx_pos]
+
+    # Creating a mask
+    pos_mask = torch.zeros_like(labels, dtype=torch.bool)
+    neg_mask = torch.zeros_like(labels, dtype=torch.bool)
+    pos_mask[pos_idx] = True
+    neg_mask[neg_idx] = True
+    return pos_mask, neg_mask
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    
+
+    

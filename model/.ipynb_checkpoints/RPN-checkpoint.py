@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 from torch import nn
-from utils import compute_iou, generate_anchor_base
+from utils import *
 
 ##### Global Variables #####
 
@@ -78,6 +78,54 @@ class RegionProposalNetwork(nn.Module):
         )
         proposals = proposals.reshape(proposals.size(0), 4) # Converting back to original [num_anchors, 4] shape. [num_anchors=B*H*W*num_anchors]
 
+        ''' Step 5: Sample Proposals and corresponding objectness scores '''
+        proposals, scores = sample_proposals(proposals, cls_scores.detach(), image.shape)
+        rpn_output = {
+            'proposals': proposals,
+            'scores': scores
+        }
+        
         # During the Inference step(Not training), skip below
         if self.training or target=None:
+            return rpn_output
+        # During Training
+        else:
+            ''' Step (1): Assign label and target gt_box to each anchor '''
+            labels_of_anchors, gt_boxes_for_anchors = assign_targets_to_anchors(target['bboxes'], anchors)
+            ''' Step (2): Based on the assigned labels / bboxes, compute bbox regression targets '''
+            target_box_offsets = compute_bbox_transformation_targets(gt_boxes_for_anchors, anchors)
+            ''' Step (3): Sample positive / negative samples '''
+            sampled_pos_mask, sampled_neg_mask = sample_positive_negative(labels_of_anchors, positive_ct=128, total_ct=256)
+            sampled_total = torch.where(sampled_pos_mask | sampled_neg_mask)[0]
+            ''' Step (4): Compute Localization Loss '''
+            localization_loss = (
+                torch.nn.functional.smoot_l1_loss(
+                    box_transform_pred[sampled_pos_mask], 
+                    target_box_offsets[sampled_pos_mask],
+                    beta=1/9,
+                    reduction="sum"
+                ) / sampled_total.numel())
+            ''' Step (5): Compute objectiveness Loss '''
+            cls_loss = torch.nn.functional.binary_cross_entroy_with_logits(
+                cls_scores[sampled_total].flatten(),
+                labels_of_anchors[sampled_total].flatten()
+            )
+
+            rpn_output['rpn_localization_loss'] = localization_loss
+            rpn_output['rpn_cls_loss'] = cls_loss
+            return rpn_output
+                
+
+
+
+
+
+
+
+
+
+
+
+
+
             
