@@ -19,8 +19,14 @@ class ROI_Detector(nn.Module):
         ROI Pooling layer is defined and done in forward() method as proposals is not ready at this stage
         '''
         # Following FC layers after ROI pooling is done
-        self.fc6 = nn.Linear(in_channels * (self.roi_pool_size ** 2), self.fc_dim) 
-        self.fc7 = nn.Linear(self.fc_dim, self.fc_dim)
+        self.fc6 = nn.Sequential(
+            nn.Linear(in_channels * (self.roi_pool_size ** 2), self.fc_dim),
+            nn.ReLU()
+        )
+        self.fc7 = nn.Sequential(
+            nn.Linear(self.fc_dim, self.fc_dim),
+            nn.ReLU()
+        )
         # Two sibling layers (cls, bbox_regressor) after FC Layers
         self.cls_layer = nn.Lienar(self.fc_dim, self.num_classes)
         self.bbox_regressor = nn.Linear(self.fc_dim, self.num_classes * 4)
@@ -45,17 +51,70 @@ class ROI_Detector(nn.Module):
             sampled_pos_mask, sampled_neg_mask = sample_positive_negative(labels_for_proposals, positive_ct=32, total_ct=128)
             sampled_total = torch.where(sampled_pos_mask | sampled_neg_mask)[0]
 
-            proposals = proposals[sampled_total] # [num_sampled_total, 4]
+            proposals = proposals[sampled_total] # [num_sampled_total, 4] = (128, 4) in our case
             labels_for_proposals = labels_for_proposals[sampled_total]     # [num_sampled_total,]
             gt_boxes_for_proposals = gt_boxes_for_proposals[sampled_total] # [num_sampled_total, 4]
             target_box_offsets = compute_bbox_transformation_targets(gt_boxes_for_proposals, proposals) # [num_sampled_total, 4]
 
         
         ''' Compute Scaling '''
-
+        size = feat.shape[-2:]
+        possible_scales = []
+        for s1, s2 in zip(size, image_shape):
+            approx_scale = float(s1) / float(s2)
+            scale = 2 ** float(torch.tensor(approx_scale).log2().round())
+            possible_scales.append(scale)
+        assert possible_scales[0] == possible_scales[1]
         ''' ROI_Pooling layer '''
         roi_pool_feat = torchvision.ops.roi_pool(feat_map, 
                                                  [proposals], 
                                                  output_size=self.roi_pool_size, 
-                                                 spatial_scale=)
+                                                 spatial_scale=possible_scales[0])
+        # Flattening roi_pooled feature with batch reserved (N, C, H, W) -> (N, C * H * W)
+        roi_pool_feat = roi_pool_feat.flatten(start_dim=1)
+        fc_out = self.fc7(self.fc_6(roi_pool_feat))
+        ''' Sibling Layers: cls_layer / bbox_regressor '''
+        cls_scores = self.cls_layer(fc_out)
+        box_transform_pred = self.bbox_regressor(fc_out)
+        num_proposals = cls_scores.shape[0]
+        box_transform_pred = box_transform_pred.reshape(num_proposals, self.num_classes, 4) #shape: [num_proposals, num_classes, 4]=[128, 20, 4]
+
+        frcnn_output = {}
         
+        ''' Compute Loss if Training stage '''
+        if self.training and target is not None:
+            ''' Classification Loss '''
+            # cls_scores: [128, 20]
+            # labels_for_proposals: [128,]
+            cls_loss = torch.nn.functional.cross_entropy(cls_scores, labels_for_proposals)
+            ''' Localization Loss '''
+            # Step 1: get the proposals that are foreground
+            fg_proposals = torch.where(labels_for_proposals > 0)[0]
+            # Step 2: get the class idx for each foreground proposals' class so that we select only those from box_transform_pred
+            #         Pick [num_foreground, 4] from the entire box_transform_pred of shape [128, 20, 4]
+            fg_cls_idx = labels_for_proposals[fg_proposals]
+            # Step 3: compute loss
+            localization_loss = (
+                torch.nn.functional.smooth_l1_loss(
+                    box_transform_pred[fg_proposals, fg_cls_idx],
+                    target_box_offsets[fg_proposals],
+                    beta = (1/9),
+                    reduction="sum"
+                ) / fg_proposals.numel()
+            )
+            ''' Saving Ouptut '''
+            frcnn_output['cls_loss'] = cls_loss
+            frcnn_output['localization_loss'] = localization_loss
+
+
+        ''' If training, output result now '''
+        if self.training:
+            return frcnn_output
+        else:
+            device = cls_scores.device
+            ''' predicted bounding boxes transformed and clamped '''
+            pred_boxes_transformed = apply_transform_to_baseAnchors_or_prposals(box_transform_pred, proposals)
+            pred_boxes_transformed = clamp_boxes(pred_boxes_transformed, image_shape)
+            ''' predicted scores '''
+            pred_scores = torch.nn.functional.softmax(cls_scores, dim=-1)
+            
