@@ -8,6 +8,8 @@ PRE_NMS_TOPK = 12000
 FINAL_TOPK = 2000
 LOW_IOU_THRESHOLD = 0.3
 HIHG_IOU_THRESHOLD = 0.7
+ROI_LOW_IOU_THRESHOLD = 0.1
+ROI_HIGH_IOU_THRESHOLD = 0.5
 ############################
 
 def compute_iou(boxes1, boxes2):
@@ -227,7 +229,7 @@ def assign_targets_to_anchors(gt_boxes, anchors):
     iou_matrix = compute_iou(gt_boxes, anchors) # (N, M)
     # Step 2: For each anchor, get the GT box index with the highest IoU
     best_iou, best_gt_idx = iou_matrix.max(dim=0) # [num_anchors_of_an_iamge,] = (M,)
-    # Step 3: Initialize labels as background (-1)
+    # Step 3: Initialize labels as Ignore (-1)
     labels = torch.full_like(best_iou, fill_value=-1, dtype=torch.float32)
     # Step 4: Apply thresholds to assign foreground (1) and background (0)
     labels[best_iou >= HIGH_IOU_THRESHOLD] = 1
@@ -303,11 +305,40 @@ def sample_positive_and_negative(labels, positive_ct, total_ct):
     return pos_mask, neg_mask
 
 
+def assign_targets_to_proposals(proposals, gt_boxes, gt_labels):
+    '''
+    This method assigns labels(-1, 0, ...) to each proposal as well as ground truth box from the gt_boxes list.
+    labels:
+        -1 : Ignore (low_threshold < iou < high_threshold)
+         0 : Background (iou < low_threshold)
+       ... : Foreground (high_threshold < iou)
+    paramenters:
+        :gt_boxes: [num_gt_boxes_of_an_image, 4]   #(N, 4)
+        :proposals: [num_proposals_of_an_image, 4] #(M, 4)
+    returns:
+        :matched_labels: [num_proposasl_of_an_image, ]    #(M,)
+        :matched_gt_boxes: [num_proposals_of_an_image, 4] #(M, 4)
+    *Note: Returned matched_gt_boxes also assigns gt_box to ignore proposals which will be filtered later
+    '''
+    # Step 1: Calculate IoU matrix
+    iou_matrix = compute_iou(gt_boxes, proposals)
+    # Step 2: For each proposal, get the GT box index with the highest IoU
+    best_iou, best_gt_idx = iou_matrix.max(dim=0) # [num_proposals_of_an_iamge,] = (M,)
+    # Step 3: Background and Ignore idx
+    background = (best_iou >= ROI_LOW_IOU_THRESHOLD) & (best_iou < ROI_HIGH_IOU_THRESHOLD)
+    ignore = (best_ious < ROI_LOW_IOU_THRESHOLD)
+    best_gt_idx[background] = -1
+    best_gt_idx[ignore] = -2
+    # Step 4: matched gt_boxes for all proposals
+    # This includes backgrounds/ignores by assigning the gt_box at index 0 through clamping -1 and -2, 
+    # This is not correct but it's okay as we will filter them out when we actually use the boxes
+    matched_gt_boxes = gt_boxes[best_gt_idx.clamp(min=0)]
+    # Step 5: matched labels for all proposals
+    labels = gt_labels[best_gt_idx.clamp(min=0)].to(dtype=torch.int32)
+    labels[background] = 0
+    labels[ignore] = -1
 
-
-
-
-
+    return matched_labels, matched_gt_boxes
 
 
 
