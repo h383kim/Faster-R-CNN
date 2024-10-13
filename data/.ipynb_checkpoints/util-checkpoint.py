@@ -1,5 +1,11 @@
 import xml.etree.ElementTree as ET
 
+VOC_CLASSES = [
+    'background', 'aeroplane', 'bicycle', 'bird', 'boat', 'bottle', 'bus', 
+    'car', 'cat', 'chair', 'cow', 'diningtable', 'dog', 'horse', 'motorbike', 
+    'person', 'pottedplant', 'sheep', 'sofa', 'train', 'tvmonitor'
+]
+
 def parse_xml_boxes(root):
     bboxes=[]
     for obj in root.findall('object'):
