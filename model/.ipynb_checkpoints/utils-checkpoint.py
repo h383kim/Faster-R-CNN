@@ -12,6 +12,12 @@ ROI_LOW_IOU_THRESHOLD = 0.1
 ROI_HIGH_IOU_THRESHOLD = 0.5
 ############################
 
+
+
+##############################################
+########## RPN & ROI_Detector Utils ##########
+##############################################
+
 def compute_iou(boxes1, boxes2):
     '''
     :boxes1: Tensor of shape [N, 4]
@@ -36,63 +42,6 @@ def compute_iou(boxes1, boxes2):
     union = area1[:, None] + area2 - intersect # (N, M)
     iou = intersect / union # (N, M)
     return iou
-
-
-def generate_anchor_base(image, feature, scales=[128, 256, 512], ratios=[0.5, 1, 2]):
-    '''
-    :image: [N, C, H, W] where N = 1
-    :feature: [N, C, H, W] where N = 1
-    Example aspect ratios assuming anchors of scale 128 sq pixels:
-    1:1 would be (128, 128)      with area=16384
-    2:1 would be (181.02, 90.51) with area=16384
-    1:2 would be (90.51, 181.02) with area=16384
-    '''
-    feat_h, feat_w = feature.shape[-2:]
-    image_h, image_w = image.shape[-2:]
-    scales = torch.as_tensor(scales, dtype=feature.dtype, device=feature.device)
-    ratios = torch.as_tensor(ratios, dtype=feature.dtype, device=feature.device)
-    
-    # Find the stride(downsampling ratio from input image to feature map)
-    stride_h = torch.tensor(image_h // feat_h, dtype=torch.int64, device=feature.device)
-    stride_w = torch.tensor(image_w // feat_w, dtype=torch.int64, device=feature.device)
-    
-    # Find the ratios the widths and heights will be stretched by
-    ratios_w = torch.sqrt(ratios)
-    ratios_h = 1 / ratios_w
-    
-    # Rescaling the widths and heights w.r.t ratios
-    '''
-    [3, 1] * [1, 3] -> [3, 3] -> [9,]
-    '''
-    widths = (ratios_w[:, None] * scales[None, :]).view(-1)
-    heights = (ratios_h[:, None] * scales[None, :]).view(-1)
-
-    # Make anchors zero centered
-    base_anchors = torch.stack([-widths, -heights, widths, heights], dim=1) / 2 # [9, 4]
-    base_anchors = base_anchors.round()
-
-    # Get the center coordinates where base_anchors will be replicated on (i.e every featuremap location on the image)
-    shift_x = torch.arange(0, feat_w, dtype=torch.int32, device=feature.device) * stride_w # [feat_w,]
-    shift_y = torhc.arange(0, feat_h, dtype=torch.int32, device=feature.device) * stride_h # [feat_h,]
-    shift_y, shift_x = torch.meshgrid(shift_y, shift_x, indexing="ij")
-    '''
-    :shift_x: [feat_H, feat_W] *Note that we do want height comes first for reason (recall PyTorch's tensors follow N,C,H,W)
-    :shift_y: [feat_H, feat_W]
-    '''
-    shift_x, shift_y = shift_x.reshape(-1), shift_y.reshape(-1)
-    '''
-    :shift_x: [feat_H * feat_W]
-    :shift_y: [feat_H * feat_W]
-    '''
-    shifts = torch.stack([shift_x, shift_y, shift_x, shift_y], dim=1)
-    ''' :shifts: [feat_H * feat_W, 4]'''
-
-    # Adding anchor variations to each featuremap location
-    ''' [feat_H * feat_W, 1, 4] + [1, num_anchors, 4] = [feat_H * feat_W, num_anchors, 4]'''
-    anchors = shifts.view(-1, 1, 4) + base_anchors.view(1, -1, 4)
-    anchors = anchors.reshape(-1, 4) # [feat_H * feat_W * num_anchors, 4]
-    
-    return anchors
 
 
 def apply_transform_to_baseAnchors_or_prposals(box_transform_pred, baseAnchors_or_proposals):
@@ -142,6 +91,7 @@ def apply_transform_to_baseAnchors_or_prposals(box_transform_pred, baseAnchors_o
     pred_boxes = torch.stack((pred_box_xmin, pred_box_ymin, pred_box_xmax, pred_box_ymax), dim=2)
     return pred_boxes
 
+
 def clamp_boxes(boxes, image_shape):
     '''
     :boxes: [num_boxes, ..., 4]
@@ -164,50 +114,6 @@ def clamp_boxes(boxes, image_shape):
         dim=-1)
     # Concat result in clamped_boxes : [num_boxes, ..., 4]
     return clamped_boxes
-                             
-
-def sample_proposals(proposals, cls_scores, image_shape):
-    '''
-    This method samples positive / negative proposals from transformed anchor boxes
-    1. Pre NMS topK filtering
-    2. Make proposals valid by clamping coordinates(0, width/height)
-    3. Small Boxes filtering based on width and height
-    4. NMS
-    5. Post NMS topK filtering
-    params:
-        :proposals: [num_anchors, 4]
-        :cls_scores: [num_anchors, 1]
-    return:
-        :sampled_proposals, sampled_scores: [num_sampled_proposals, 4], [num_sampled_proposals]
-    '''
-    # Step 1: Pre NMS topK
-    cls_scores = cls_scores.reshape(-1)    # [num_anchors, ]
-    cls_scores = torch.sigmoid(cls_scores) # All scores are distributed between 0 and 1
-    _, topk_idx = torch.topk(cls_scores, min(PRE_NMS_TOPK, len(cls_scores)))
-    proposals = proposals[topk_idx]
-    cls_scores[topk_idx]
-    
-    # Step 2: Clamp boxes to fit in image
-    proposals = clamp_boxes(proposals, image_shape)
-
-    # Step 3: Filter out small boxes based on min size width/height
-    min_size = 16
-    ws, hs = proposals[:, 2] - proposals[:, 0], proposals[:, 3] - proposals[:, 1]
-    keep = (ws >= min_size) & (hs >= min_size) # 0s and 1s
-    keep = torch.where(keep)[0] # Trues and Falses
-    proposals = proposals[keep]
-    cls_scores = cls_scores[keep]
-
-    # Step 4: Apply NMS based on the objectness score
-    keep_idx = nms(proposals, cls_scores, 0.7)
-    # Sort
-    sorted_keep_idx = keep_idx[cls_scores[keep_idx].sort(descending=True)[1]]
-
-    # Step 5: TopK objectness proposals after NMS
-    proposals = proposals[sorted_keep_idx[:FINAL_TOPK]]
-    cls_scores = cls_scores[sorted_keep_idx[:FINAL_TOPK]]
-
-    return proposals, cls_scores
 
 
 def assign_targets_to_anchors(gt_boxes, anchors):
@@ -305,6 +211,125 @@ def sample_positive_and_negative(labels, positive_ct, total_ct):
     return pos_mask, neg_mask
 
 
+
+
+
+
+###############################
+########## RPN Utils ##########
+###############################
+
+def generate_anchor_base(image, feature, scales=[128, 256, 512], ratios=[0.5, 1, 2]):
+    '''
+    :image: [N, C, H, W] where N = 1
+    :feature: [N, C, H, W] where N = 1
+    Example aspect ratios assuming anchors of scale 128 sq pixels:
+    1:1 would be (128, 128)      with area=16384
+    2:1 would be (181.02, 90.51) with area=16384
+    1:2 would be (90.51, 181.02) with area=16384
+    '''
+    feat_h, feat_w = feature.shape[-2:]
+    image_h, image_w = image.shape[-2:]
+    scales = torch.as_tensor(scales, dtype=feature.dtype, device=feature.device)
+    ratios = torch.as_tensor(ratios, dtype=feature.dtype, device=feature.device)
+    
+    # Find the stride(downsampling ratio from input image to feature map)
+    stride_h = torch.tensor(image_h // feat_h, dtype=torch.int64, device=feature.device)
+    stride_w = torch.tensor(image_w // feat_w, dtype=torch.int64, device=feature.device)
+    
+    # Find the ratios the widths and heights will be stretched by
+    ratios_w = torch.sqrt(ratios)
+    ratios_h = 1 / ratios_w
+    
+    # Rescaling the widths and heights w.r.t ratios
+    '''
+    [3, 1] * [1, 3] -> [3, 3] -> [9,]
+    '''
+    widths = (ratios_w[:, None] * scales[None, :]).view(-1)
+    heights = (ratios_h[:, None] * scales[None, :]).view(-1)
+
+    # Make anchors zero centered
+    base_anchors = torch.stack([-widths, -heights, widths, heights], dim=1) / 2 # [9, 4]
+    base_anchors = base_anchors.round()
+
+    # Get the center coordinates where base_anchors will be replicated on (i.e every featuremap location on the image)
+    shift_x = torch.arange(0, feat_w, dtype=torch.int32, device=feature.device) * stride_w # [feat_w,]
+    shift_y = torhc.arange(0, feat_h, dtype=torch.int32, device=feature.device) * stride_h # [feat_h,]
+    shift_y, shift_x = torch.meshgrid(shift_y, shift_x, indexing="ij")
+    '''
+    :shift_x: [feat_H, feat_W] *Note that we do want height comes first for reason (recall PyTorch's tensors follow N,C,H,W)
+    :shift_y: [feat_H, feat_W]
+    '''
+    shift_x, shift_y = shift_x.reshape(-1), shift_y.reshape(-1)
+    '''
+    :shift_x: [feat_H * feat_W]
+    :shift_y: [feat_H * feat_W]
+    '''
+    shifts = torch.stack([shift_x, shift_y, shift_x, shift_y], dim=1)
+    ''' :shifts: [feat_H * feat_W, 4]'''
+
+    # Adding anchor variations to each featuremap location
+    ''' [feat_H * feat_W, 1, 4] + [1, num_anchors, 4] = [feat_H * feat_W, num_anchors, 4]'''
+    anchors = shifts.view(-1, 1, 4) + base_anchors.view(1, -1, 4)
+    anchors = anchors.reshape(-1, 4) # [feat_H * feat_W * num_anchors, 4]
+    
+    return anchors
+                   
+
+def sample_proposals(proposals, cls_scores, image_shape):
+    '''
+    This method samples positive / negative proposals from transformed anchor boxes
+    1. Pre NMS topK filtering
+    2. Make proposals valid by clamping coordinates(0, width/height)
+    3. Small Boxes filtering based on width and height
+    4. NMS
+    5. Post NMS topK filtering
+    params:
+        :proposals: [num_anchors, 4]
+        :cls_scores: [num_anchors, 1]
+    return:
+        :sampled_proposals, sampled_scores: [num_sampled_proposals, 4], [num_sampled_proposals]
+    '''
+    # Step 1: Pre NMS topK
+    cls_scores = cls_scores.reshape(-1)    # [num_anchors, ]
+    cls_scores = torch.sigmoid(cls_scores) # All scores are distributed between 0 and 1
+    _, topk_idx = torch.topk(cls_scores, min(PRE_NMS_TOPK, len(cls_scores)))
+    proposals = proposals[topk_idx]
+    cls_scores[topk_idx]
+    
+    # Step 2: Clamp boxes to fit in image
+    proposals = clamp_boxes(proposals, image_shape)
+
+    # Step 3: Filter out small boxes based on min size width/height
+    min_size = 16
+    ws, hs = proposals[:, 2] - proposals[:, 0], proposals[:, 3] - proposals[:, 1]
+    keep = (ws >= min_size) & (hs >= min_size) # 0s and 1s
+    keep = torch.where(keep)[0] # Trues and Falses
+    proposals = proposals[keep]
+    cls_scores = cls_scores[keep]
+
+    # Step 4: Apply NMS based on the objectness score
+    keep_idx = nms(proposals, cls_scores, 0.7)
+    # Sort
+    sorted_keep_idx = keep_idx[cls_scores[keep_idx].sort(descending=True)[1]]
+
+    # Step 5: TopK objectness proposals after NMS
+    proposals = proposals[sorted_keep_idx[:FINAL_TOPK]]
+    cls_scores = cls_scores[sorted_keep_idx[:FINAL_TOPK]]
+
+    return proposals, cls_scores
+
+
+
+
+
+
+
+
+########################################
+########## ROI_Detector Utils ##########
+########################################
+
 def assign_targets_to_proposals(proposals, gt_boxes, gt_labels):
     '''
     This method assigns labels(-1, 0, ...) to each proposal as well as ground truth box from the gt_boxes list.
@@ -347,9 +372,48 @@ def assign_targets_to_proposals(proposals, gt_boxes, gt_labels):
 
 
 
+###############################################
+########## Faster-RCNN Wrapper Utils ##########
+###############################################
 
+def normalize_resize_image_and_boxes(image, bboxes, image_mean, image_std, min_size=600, max_size=1000):
+    dtype, device = image.dtype, image.device
 
+    # Normalize
+    mean = torch.as_tensor(image_mean, dtype=dtype, device=device)
+    std = torch.as_tensor(image_std, dtype=dtype, device=device)
+    image = (image - mean[:, None, None]) / std[:, None, None] # Broadcasting for image shape [3, H, W]
 
-    
+    # Find scaling factor such taht the smaller dimension (either height or width) is scaled up to 600, and
+    # the larger dimension (the other axis) does not exceed 1000
+    h, w = image.shape[-2:] # Store image shape before change
+    image_shape = torch.tensor(image.shape[-2:])
+    smaller_dim = torch.min(image_shape).to(dtype=torch.float32)
+    larger_dim = torch.max(image_shape).to(dtype=torch.float32)
+    scaling_factor = torch.min((min_size / smaller_dim), (max_size / larger_dim))
 
-    
+    # Resize image based on scale computed
+    image = torch.nn.functional.interpolate(
+        image,
+        size=None,
+        scale_factor=scale_factor,
+        mode="bilinear",
+        recompute_scale_factor=True,
+        align_corners=False,
+    )
+
+    if bboxes is not None:
+        # Resize boxes by
+        ratios = [
+            torch.tensor(s, dtype=torch.float32, device=bboxes.device)
+            / torch.tensor(s_orig, dtype=torch.float32, device=bboxes.device)
+            for s, s_orig in zip(image.shape[-2:], (h, w))
+        ]
+        ratio_height, ratio_width = ratios
+        xmin, ymin, xmax, ymax = bboxes.unbind(2)
+        xmin = xmin * ratio_width
+        xmax = xmax * ratio_width
+        ymin = ymin * ratio_height
+        ymax = ymax * ratio_height
+        bboxes = torch.stack((xmin, ymin, xmax, ymax), dim=2)
+    return image, bboxes

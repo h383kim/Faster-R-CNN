@@ -1,6 +1,6 @@
 import torch
 from torch import nn
-from utils import *
+from model.utils import *
 
 ##### Global Variables #####
 ROI_POOL_SIZE = 7
@@ -28,7 +28,7 @@ class ROI_Detector(nn.Module):
             nn.ReLU()
         )
         # Two sibling layers (cls, bbox_regressor) after FC Layers
-        self.cls_layer = nn.Lienar(self.fc_dim, self.num_classes)
+        self.cls_layer = nn.Linear(self.fc_dim, self.num_classes)
         self.bbox_regressor = nn.Linear(self.fc_dim, self.num_classes * 4)
 
         '''

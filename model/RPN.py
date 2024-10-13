@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 from torch import nn
-from utils import *
+from model.utils import *
 
 ##### Global Variables #####
 
@@ -9,7 +9,7 @@ from utils import *
 
 class RegionProposalNetwork(nn.Module):
     def __init__(self, in_channels=512, mid_channels=512,
-                 scales=[128, 256, 512], ratios=[0.5, 1, 2):
+                 scales=[128, 256, 512], ratios=[0.5, 1, 2]):
         super().__init__()
         self.scales = scales
         self.ratios = ratios
@@ -25,17 +25,17 @@ class RegionProposalNetwork(nn.Module):
         The resulting feature maps will have spatial dimension remained H x W
         and each feature map at (x,y) will represent the "Predicted back/foreground scores for each anchor"
         '''
-        self.cls_layer = nn.Conv2d(in_channels=mid_channels, out_channels=num_anchors*2, kernel_size=(1, 1), stride=1)
+        self.cls_layer = nn.Conv2d(in_channels=mid_channels, out_channels=self.num_anchors*2, kernel_size=(1, 1), stride=1)
         '''
         1x1 conv layer to predict bbox regression offset
         [B, 512, H, W] -> [B, num_anchors * 4, H, W]
         The resulting feature maps will have spatial dimension remained H x W
         and each feature map at (x,y) will represent the "Predicted bounding box offsets and scales for each anchor"
         '''
-        self.bbox_layer = nn.Conv2d(in_channels=mid_channels, out_channels=num_anchors*4, kernel_size=(1, 1), stride=1)
+        self.bbox_layer = nn.Conv2d(in_channels=mid_channels, out_channels=self.num_anchors*4, kernel_size=(1, 1), stride=1)
 
 
-    def forward(self, feat_map, image):
+    def forward(self, feat_map, image, target=None):
         ''' Step 1: Feed forward to get class / box_transform prediction feature maps'''
         rpn_feat = nn.ReLU()(self.rpn_conv(feat_map))
         cls_scores = self.cls_layer(rpn_feat)
@@ -68,8 +68,9 @@ class RegionProposalNetwork(nn.Module):
             4,
             box_transform_pred.shape[-2],
             box_transform_pred.shape[-1],
+        )
         box_transform_pred = box_transform_pred.permute(0, 3, 4, 1, 2)
-        box_transform_pred = box_transform_pred.reshape(-1, 4)
+        box_transform_pred.reshape(-1, 4)
 
         ''' Step 4: Transform the base anchors by applying the predicted box_transform (i.e. box_transform_pred)'''
         proposals = apply_transform_to_baseAnchors_or_proposals(
@@ -86,7 +87,7 @@ class RegionProposalNetwork(nn.Module):
         }
         
         # During the Inference step(Not training), skip below
-        if self.training or target=None:
+        if self.training or target is None:
             return rpn_output
         # During Training
         else:
