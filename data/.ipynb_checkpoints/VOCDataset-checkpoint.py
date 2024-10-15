@@ -12,14 +12,10 @@ class CustomDataset(Dataset):
         self.transform = transform
         self.img_set = img_set
         
-        # self.annotation_path = os.path.join(self.root, f'VOC{self.img_set}_06-Nov-2007', 'VOCdevkit', 'VOC2007', 'Annotations')
-        # self.img_path = os.path.join(self.root, f'VOC{self.img_set}_06-Nov-2007', 'VOCdevkit', 'VOC2007', 'JPEGImages')
         self.annotation_path = os.path.join(self.root, f'PASCAL_VOC_{self.img_set}', 'VOCdevkit', 'VOC2007', 'Annotations')
         self.img_path = os.path.join(self.root, f'PASCAL_VOC_{self.img_set}', 'VOCdevkit', 'VOC2007', 'JPEGImages')
         self.annotations = [os.path.join(self.annotation_path, xml) for xml in sorted(os.listdir(self.annotation_path)) if not xml.startswith('.')]
         self.images = [os.path.join(self.img_path, xml) for xml in sorted(os.listdir(self.img_path)) if not xml.startswith('.')]
-        self.annotations = self.annotations[3000:4000]
-        self.images = self.images[3000:4000]
         
     def __len__(self):
         return len(self.images)

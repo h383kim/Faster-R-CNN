@@ -2,6 +2,7 @@ import torch
 from torch import nn
 from model.utils import *
 
+
 ##### Global Variables #####
 ROI_POOL_SIZE = 7
 FCL_DIM = 2048
@@ -28,7 +29,7 @@ class ROI_Detector(nn.Module):
             nn.ReLU()
         )
         # Two sibling layers (cls, bbox_regressor) after FC Layers
-        self.cls_layer = nn.Linear(self.fc_dim, self.num_classes)
+        self.cls_layer = nn.Linear(self.fc_dim, self.num_classes + 1)
         self.bbox_regressor = nn.Linear(self.fc_dim, self.num_classes * 4)
 
         '''
@@ -48,7 +49,7 @@ class ROI_Detector(nn.Module):
             ''' Step 1: tagging proposals '''
             labels_for_proposals, gt_boxes_for_proposals = assign_targets_to_proposals(proposals, gt_boxes, gt_labels)
             ''' Step 2: sample positive and negative '''
-            sampled_pos_mask, sampled_neg_mask = sample_positive_negative(labels_for_proposals, positive_ct=32, total_ct=128)
+            sampled_pos_mask, sampled_neg_mask = sample_positive_and_negative(labels_for_proposals, positive_ct=32, total_ct=128)
             sampled_total = torch.where(sampled_pos_mask | sampled_neg_mask)[0]
 
             proposals = proposals[sampled_total] # [num_sampled_total, 4] = (128, 4) in our case
@@ -58,7 +59,7 @@ class ROI_Detector(nn.Module):
 
         
         ''' Compute Scaling '''
-        size = feat.shape[-2:]
+        size = feat_map.shape[-2:]
         possible_scales = []
         for s1, s2 in zip(size, image_shape):
             approx_scale = float(s1) / float(s2)
@@ -72,9 +73,9 @@ class ROI_Detector(nn.Module):
                                                  spatial_scale=possible_scales[0])
         # Flattening roi_pooled feature with batch reserved (N, C, H, W) -> (N, C * H * W)
         roi_pool_feat = roi_pool_feat.flatten(start_dim=1)
-        fc_out = self.fc7(self.fc_6(roi_pool_feat))
+        fc_out = self.fc7(self.fc6(roi_pool_feat))
         ''' Sibling Layers: cls_layer / bbox_regressor '''
-        cls_scores = self.cls_layer(fc_out)
+        cls_scores = self.cls_layer(fc_out) 
         box_transform_pred = self.bbox_regressor(fc_out)
         num_proposals = cls_scores.shape[0]
         box_transform_pred = box_transform_pred.reshape(num_proposals, self.num_classes, 4) #shape: [num_proposals, num_classes, 4]=[128, 20, 4]
@@ -84,15 +85,17 @@ class ROI_Detector(nn.Module):
         ''' Compute Loss if Training stage '''
         if self.training and target is not None:
             ''' Classification Loss '''
-            # cls_scores: [128, 20]
+            # cls_scores: [128, 21]
             # labels_for_proposals: [128,]
-            cls_loss = torch.nn.functional.cross_entropy(cls_scores, labels_for_proposals)
+            # ignore_index doesn't take 0 from labels_for_proposals as it is background
+            cls_loss = torch.nn.functional.cross_entropy(cls_scores, labels_for_proposals.long())
             ''' Localization Loss '''
             # Step 1: get the proposals that are foreground
             fg_proposals = torch.where(labels_for_proposals > 0)[0]
             # Step 2: get the class idx for each foreground proposals' class so that we select only those from box_transform_pred
             #         Pick [num_foreground, 4] from the entire box_transform_pred of shape [128, 20, 4]
-            fg_cls_idx = labels_for_proposals[fg_proposals]
+            # Subtract 1 from all because there are 20 fg_classes while classification includes background = 21
+            fg_cls_idx = labels_for_proposals[fg_proposals] - 1
             # Step 3: compute loss
             localization_loss = (
                 torch.nn.functional.smooth_l1_loss(
@@ -110,11 +113,35 @@ class ROI_Detector(nn.Module):
         ''' If training, output result now '''
         if self.training:
             return frcnn_output
+        
         else:
+            ''' 
+            If Inferencing
+            :cls_scores: [num_proposals, 21] where num_proposals is around ~2000
+            :box_transform_pred: [num_proposals, 4] 
+            '''
             device = cls_scores.device
-            ''' predicted bounding boxes transformed and clamped '''
-            pred_boxes_transformed = apply_transform_to_baseAnchors_or_prposals(box_transform_pred, proposals)
-            pred_boxes_transformed = clamp_boxes(pred_boxes_transformed, image_shape)
-            ''' predicted scores '''
-            pred_scores = torch.nn.functional.softmax(cls_scores, dim=-1)
             
+            ''' predicted bounding boxes transformed and clamped '''
+            pred_boxes_transformed = apply_transform_to_baseAnchors_or_proposals(box_transform_pred, proposals)
+            pred_boxes_transformed = clamp_boxes(pred_boxes_transformed, image_shape) # [num_proposals, num_classes, 4]
+            
+            ''' predicted scores '''
+            pred_scores = torch.nn.functional.softmax(cls_scores, dim=-1) # [num_proposals. 21]
+            
+            ''' labels '''
+            pred_labels = torch.argmax(pred_scores, dim=1) # [num_proposals,]
+            
+            ''' Filter out background predictions '''
+            fg_proposals = torch.where(pred_labels > 0)[0]
+            pred_boxes_transformed = pred_boxes_transformed[fg_proposals] # [num_fg_proposals, num_classes, 4]
+            pred_scores = pred_scores[fg_proposals, 1:] # [num_fg_proposals, 20]
+            pred_labels = pred_labels[fg_proposals]     # [num_fg_proposals,]
+            
+            ''' Apply class-wise NMS '''
+            pred_boxes, pred_scores, pred_labels = apply_nms(pred_boxes_transformed.detach(), pred_scores.detach(), pred_labels.detach())
+            frcnn_output['bboxes'] = pred_boxes
+            frcnn_output['scores'] = pred_scores
+            frcnn_output['labels'] = pred_labels
+            
+            return frcnn_output

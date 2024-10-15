@@ -2,14 +2,17 @@ import torch
 import torchvision
 from torchvision.ops import nms
 import numpy as np
+import math
+import matplotlib.pyplot as plt
 
 ##### Global Variables #####
 PRE_NMS_TOPK = 12000
 FINAL_TOPK = 2000
 LOW_IOU_THRESHOLD = 0.3
-HIHG_IOU_THRESHOLD = 0.7
+HIGH_IOU_THRESHOLD = 0.7
 ROI_LOW_IOU_THRESHOLD = 0.1
 ROI_HIGH_IOU_THRESHOLD = 0.5
+INFER_NMS_THRESHOLD = 0.7
 ############################
 
 
@@ -44,7 +47,7 @@ def compute_iou(boxes1, boxes2):
     return iou
 
 
-def apply_transform_to_baseAnchors_or_prposals(box_transform_pred, baseAnchors_or_proposals):
+def apply_transform_to_baseAnchors_or_proposals(box_transform_pred, baseAnchors_or_proposals):
     '''
     This method is used for both:
     1. Creating proposals in RPN (In which case num_classes=1)
@@ -55,20 +58,19 @@ def apply_transform_to_baseAnchors_or_prposals(box_transform_pred, baseAnchors_o
         where num_anchors = Batch_size(1) * feat_H * feat_W * anchors_per_location
         and num_classes = 1
     In case 2,
-        :box_transform_pred:
+        :box_transform_pred: [num_proposals, num_classes, 4]
         :baseAnchors_or_proposals: [num_proposals, 4]
-        where
-        and num_classes = 21
+        where num_classes = 20
     '''
     box_transform_pred = box_transform_pred.reshape(
-        box_trasnform_pred.size(0), -1, 4
+        box_transform_pred.size(0), -1, 4
     )
 
     ws = baseAnchors_or_proposals[:, 2] - baseAnchors_or_proposals[:, 0] # [num_anchors_or_proposals]
     hs = baseAnchors_or_proposals[:, 3] - baseAnchors_or_proposals[:, 1]
     ctr_x = baseAnchors_or_proposals[:, 0] + (0.5 * ws) # [num_anchors_or_proposals]
     ctr_y = baseAnchors_or_proposals[:, 1] + (0.5 * hs)
-
+    
     # t* shape : [num_anchors_or_proposals, num_classes]
     t_x, t_y, t_w, t_h = box_transform_pred[..., 0], box_transform_pred[..., 1], box_transform_pred[..., 2], box_transform_pred[..., 3]
     
@@ -81,7 +83,7 @@ def apply_transform_to_baseAnchors_or_prposals(box_transform_pred, baseAnchors_o
     pred_ctr_y = t_y * hs[:, None] + ctr_y[:, None]
     pred_w = torch.exp(t_w) * ws[:, None]
     pred_h = torch.exp(t_h) * hs[:, None]
-
+    
     pred_box_xmin = pred_ctr_x - (0.5 * pred_w)
     pred_box_ymin = pred_ctr_y - (0.5 * pred_h)
     pred_box_xmax = pred_ctr_x + (0.5 * pred_w)
@@ -107,10 +109,10 @@ def clamp_boxes(boxes, image_shape):
     ymax = ymax.clamp(min=0, max=height)
     # Reconstructing boxes
     clamped_boxes = torch.cat((
-        xmin[:, None], # Adding new dimensions to make [num_boxes, ..., 1]
-        ymin[:, None],
-        xmax[:, None],
-        ymax[:, None]),
+        xmin[..., None], # Adding new dimensions to make [num_boxes, ..., 1]
+        ymin[..., None],
+        xmax[..., None],
+        ymax[..., None]),
         dim=-1)
     # Concat result in clamped_boxes : [num_boxes, ..., 4]
     return clamped_boxes
@@ -201,7 +203,7 @@ def sample_positive_and_negative(labels, positive_ct, total_ct):
     random_idx_pos = torch.randperm(pos_idx.size(0), device=pos_idx.device)[:actual_positive_ct]
     random_idx_neg = torch.randperm(neg_idx.size(0), device=neg_idx.device)[:actual_negative_ct]
     pos_idx = pos_idx[random_idx_pos]
-    neg_idx = neg_idx[random_idx_pos]
+    neg_idx = neg_idx[random_idx_neg]
 
     # Creating a mask
     pos_mask = torch.zeros_like(labels, dtype=torch.bool)
@@ -254,7 +256,7 @@ def generate_anchor_base(image, feature, scales=[128, 256, 512], ratios=[0.5, 1,
 
     # Get the center coordinates where base_anchors will be replicated on (i.e every featuremap location on the image)
     shift_x = torch.arange(0, feat_w, dtype=torch.int32, device=feature.device) * stride_w # [feat_w,]
-    shift_y = torhc.arange(0, feat_h, dtype=torch.int32, device=feature.device) * stride_h # [feat_h,]
+    shift_y = torch.arange(0, feat_h, dtype=torch.int32, device=feature.device) * stride_h # [feat_h,]
     shift_y, shift_x = torch.meshgrid(shift_y, shift_x, indexing="ij")
     '''
     :shift_x: [feat_H, feat_W] *Note that we do want height comes first for reason (recall PyTorch's tensors follow N,C,H,W)
@@ -295,7 +297,7 @@ def sample_proposals(proposals, cls_scores, image_shape):
     cls_scores = torch.sigmoid(cls_scores) # All scores are distributed between 0 and 1
     _, topk_idx = torch.topk(cls_scores, min(PRE_NMS_TOPK, len(cls_scores)))
     proposals = proposals[topk_idx]
-    cls_scores[topk_idx]
+    cls_scores = cls_scores[topk_idx]
     
     # Step 2: Clamp boxes to fit in image
     proposals = clamp_boxes(proposals, image_shape)
@@ -351,7 +353,7 @@ def assign_targets_to_proposals(proposals, gt_boxes, gt_labels):
     best_iou, best_gt_idx = iou_matrix.max(dim=0) # [num_proposals_of_an_iamge,] = (M,)
     # Step 3: Background and Ignore idx
     background = (best_iou >= ROI_LOW_IOU_THRESHOLD) & (best_iou < ROI_HIGH_IOU_THRESHOLD)
-    ignore = (best_ious < ROI_LOW_IOU_THRESHOLD)
+    ignore = (best_iou < ROI_LOW_IOU_THRESHOLD)
     best_gt_idx[background] = -1
     best_gt_idx[ignore] = -2
     # Step 4: matched gt_boxes for all proposals
@@ -363,12 +365,35 @@ def assign_targets_to_proposals(proposals, gt_boxes, gt_labels):
     labels[background] = 0
     labels[ignore] = -1
 
-    return matched_labels, matched_gt_boxes
+    return labels, matched_gt_boxes
 
 
-
-
-
+def apply_nms(boxes, scores, labels):
+    final_boxes = torch.empty((0, 4), device=device)
+    final_scores = torch.empty(0, device=device)
+    final_labels = torch.empty(0, device=device)
+    
+    class_ids = torch.unique(labels)
+    for cls_id in class_ids:
+        cls_indices = torch.where(labels == cls_id)[0]
+        
+        # Select the boxes and scores for this class only
+        cls_boxes = boxes[cls_indices, cls_id - 1, :] # [num_fg, num_classes, 4] -> [num_cls_proposals, 4]
+        cls_scores = scores[cls_indices, cls_id - 1]  # [num_fg, 20] -> [num_cls_proposals,]
+       
+        keep = nms(cls_boxes, cls_scores, INFER_NMS_THRESHOLD)
+        
+        # Choosing kept boxes and scores for this class only
+        kept_boxes = boxes[cls_indices[keep], cls_id - 1, :]
+        kept_scores = scores[cls_indices[keep], cls_id - 1]
+        kept_labels = torch.full_like(kept_scores, cls_id)
+        
+        # Appending to the existing
+        final_boxes = torch.cat((final_boxes, kept_boxes), dim=0)
+        final_scores = torch.cat((final_scores, kept_scores), dim=0)
+        final_labels = torch.cat((final_labels, kept_labels), dim=0)
+        
+    return final_boxes, final_scores, final_labels
 
 
 
@@ -378,12 +403,12 @@ def assign_targets_to_proposals(proposals, gt_boxes, gt_labels):
 
 def normalize_resize_image_and_boxes(image, bboxes, image_mean, image_std, min_size=600, max_size=1000):
     dtype, device = image.dtype, image.device
-
+    
     # Normalize
     mean = torch.as_tensor(image_mean, dtype=dtype, device=device)
     std = torch.as_tensor(image_std, dtype=dtype, device=device)
     image = (image - mean[:, None, None]) / std[:, None, None] # Broadcasting for image shape [3, H, W]
-
+    
     # Find scaling factor such taht the smaller dimension (either height or width) is scaled up to 600, and
     # the larger dimension (the other axis) does not exceed 1000
     h, w = image.shape[-2:] # Store image shape before change
@@ -396,7 +421,7 @@ def normalize_resize_image_and_boxes(image, bboxes, image_mean, image_std, min_s
     image = torch.nn.functional.interpolate(
         image,
         size=None,
-        scale_factor=scale_factor,
+        scale_factor=scaling_factor,
         mode="bilinear",
         recompute_scale_factor=True,
         align_corners=False,
@@ -417,3 +442,23 @@ def normalize_resize_image_and_boxes(image, bboxes, image_mean, image_std, min_s
         ymax = ymax * ratio_height
         bboxes = torch.stack((xmin, ymin, xmax, ymax), dim=2)
     return image, bboxes
+
+
+def transform_boxes_to_original_size(boxes, cur_size, original_size):
+    '''
+    Current boxes are in resized scale (min_size=600, max_size=1000).
+    This method takes this boxes with current dimensions(cur_size) back to
+    the original image_scale(original_size)
+    '''
+    ratios = [
+        torch.tensor(s_orig, dtype=torch.float32, device=boxes.device)
+        / torch.tensor(s, dtype=torch.float32, device=boxes.device)
+        for s, s_orig in zip(cur_size, original_size)
+    ]
+    ratio_height, ratio_width = ratios
+    xmin, ymin, xmax, ymax = boxes.unbind(1)
+    xmin = xmin * ratio_width
+    xmax = xmax * ratio_width
+    ymin = ymin * ratio_height
+    ymax = ymax * ratio_height
+    return torch.stack((xmin, ymin, xmax, ymax), dim=1)

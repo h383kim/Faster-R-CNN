@@ -10,7 +10,6 @@ IMAGE_MIN_DIM = 600
 IMAGE_MAX_DIM = 1000
 ############################
 
-
 vgg16 = models.vgg16_bn(weights="IMAGENET1K_V1", progress=False)
 
 class FasterRCNN(nn.Module):
@@ -39,10 +38,15 @@ class FasterRCNN(nn.Module):
     def forward(self, image, target=None):
         old_shape = image.shape[-2:]
         if self.training:
+            target['labels'] = target['labels'].squeeze(dim=0)
+            # image from (N, W, C, H) -> (N, C, H, W)
+            image = image.permute(0, 2, 3, 1)
             # Normalize and resize image and boxes
             image, bboxes = normalize_resize_image_and_boxes(image, target['bboxes'], self.image_mean, self.image_std)
-            target['bboxes'] = bboxes
+            target['bboxes'] = bboxes.squeeze(dim=0)
         else:
+            # image from (C, H, W) -> (N, C, H, W)
+            image = image.unsqueeze(dim=0)
             # Normalize and resize image only when inferencing
             image, _ = normalize_resize_image_and_boxes(image, None, self.image_mean, self.image_std)
             
@@ -53,5 +57,10 @@ class FasterRCNN(nn.Module):
         proposals = rpn_output['proposals']
         # Feed forward ROI_Detector
         roi_detector_output = self.roi_detector(feat_map, proposals, image.shape[-2:], target)
-
+        
+        ''' If Inferencing, find predicted boxes in original image size '''
+        if not self.training:
+            roi_detector_output['bboxes'] = transform_boxes_to_original_size(roi_detector_output['bboxes'],
+                                                                             image.shape[-2:],
+                                                                             old_shape)
         return rpn_output, roi_detector_output

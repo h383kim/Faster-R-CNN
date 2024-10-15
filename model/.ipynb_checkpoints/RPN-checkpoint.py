@@ -3,9 +3,7 @@ import torch
 from torch import nn
 from model.utils import *
 
-##### Global Variables #####
 
-############################
 
 class RegionProposalNetwork(nn.Module):
     def __init__(self, in_channels=512, mid_channels=512,
@@ -25,7 +23,7 @@ class RegionProposalNetwork(nn.Module):
         The resulting feature maps will have spatial dimension remained H x W
         and each feature map at (x,y) will represent the "Predicted back/foreground scores for each anchor"
         '''
-        self.cls_layer = nn.Conv2d(in_channels=mid_channels, out_channels=self.num_anchors*2, kernel_size=(1, 1), stride=1)
+        self.cls_layer = nn.Conv2d(in_channels=mid_channels, out_channels=self.num_anchors, kernel_size=(1, 1), stride=1)
         '''
         1x1 conv layer to predict bbox regression offset
         [B, 512, H, W] -> [B, num_anchors * 4, H, W]
@@ -45,40 +43,34 @@ class RegionProposalNetwork(nn.Module):
         '''
         :base_anchors: [feat_H * feat_W, num_anchors, 4]
         '''
-        base_anchors = generate_base_anchors(image, feat_map)
+        base_anchors = generate_anchor_base(image, feat_map)
 
         ''' Step 3: Reshaping cls_scores and box_transform_pred feature maps '''
-        # Reshaping cls_scores
         '''
         :before: [B, num_anchors, feat_H, feat_W]
         :after:  [B * feat_H * feat_W * num_anchors, 2]
         '''
-        number_of_anchors_per_location = cls_scores.size(1) / 2
         cls_scores = cls_scores.permute(0, 2, 3, 1)
         cls_scores = cls_scores.reshape(-1, 1)
-
-        # Reshaping box_transform_pred
         '''
         :before: [B, num_anchors * 4, feat_H, feat_W]
         :after:  [B * feat_H * feat_2 * num_anchors, 4]
         '''
         box_transform_pred = box_transform_pred.view(
             box_transform_pred.size(0),
-            number_of_anchors_per_location,
+            self.num_anchors,
             4,
             box_transform_pred.shape[-2],
-            box_transform_pred.shape[-1],
+            box_transform_pred.shape[-1]
         )
         box_transform_pred = box_transform_pred.permute(0, 3, 4, 1, 2)
-        box_transform_pred.reshape(-1, 4)
-
+        box_transform_pred = box_transform_pred.reshape(-1, 4)
         ''' Step 4: Transform the base anchors by applying the predicted box_transform (i.e. box_transform_pred)'''
         proposals = apply_transform_to_baseAnchors_or_proposals(
             box_transform_pred.detach().reshape(-1, 1, 4), # Adding a new dimension num_classes=1 to fit the method requirement 
             base_anchors
         )
         proposals = proposals.reshape(proposals.size(0), 4) # Converting back to original [num_anchors, 4] shape. [num_anchors=B*H*W*num_anchors]
-
         ''' Step 5: Sample Proposals and corresponding objectness scores '''
         proposals, scores = sample_proposals(proposals, cls_scores.detach(), image.shape)
         rpn_output = {
@@ -87,27 +79,27 @@ class RegionProposalNetwork(nn.Module):
         }
         
         # During the Inference step(Not training), skip below
-        if self.training or target is None:
+        if not self.training or target is None:
             return rpn_output
         # During Training
         else:
             ''' Step (1): Assign label and target gt_box to each anchor '''
-            labels_of_anchors, gt_boxes_for_anchors = assign_targets_to_anchors(target['bboxes'], anchors)
+            labels_of_anchors, gt_boxes_for_anchors = assign_targets_to_anchors(target['bboxes'], base_anchors)
             ''' Step (2): Based on the assigned labels / bboxes, compute bbox regression targets '''
-            target_box_offsets = compute_bbox_transformation_targets(gt_boxes_for_anchors, anchors)
+            target_box_offsets = compute_bbox_transformation_targets(gt_boxes_for_anchors, base_anchors)
             ''' Step (3): Sample positive / negative samples '''
-            sampled_pos_mask, sampled_neg_mask = sample_positive_negative(labels_of_anchors, positive_ct=128, total_ct=256)
+            sampled_pos_mask, sampled_neg_mask = sample_positive_and_negative(labels_of_anchors, positive_ct=128, total_ct=256)
             sampled_total = torch.where(sampled_pos_mask | sampled_neg_mask)[0]
             ''' Step (4): Compute Localization Loss '''
             localization_loss = (
-                torch.nn.functional.smoot_l1_loss(
+                torch.nn.functional.smooth_l1_loss(
                     box_transform_pred[sampled_pos_mask], 
                     target_box_offsets[sampled_pos_mask],
                     beta=1/9,
                     reduction="sum"
                 ) / sampled_total.numel())
             ''' Step (5): Compute objectiveness Loss '''
-            cls_loss = torch.nn.functional.binary_cross_entroy_with_logits(
+            cls_loss = torch.nn.functional.binary_cross_entropy_with_logits(
                 cls_scores[sampled_total].flatten(),
                 labels_of_anchors[sampled_total].flatten()
             )
@@ -115,18 +107,3 @@ class RegionProposalNetwork(nn.Module):
             rpn_output['rpn_localization_loss'] = localization_loss
             rpn_output['rpn_cls_loss'] = cls_loss
             return rpn_output
-                
-
-
-
-
-
-
-
-
-
-
-
-
-
-            
